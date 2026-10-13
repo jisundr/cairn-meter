@@ -892,41 +892,6 @@ def test_start_runs_backfill_into_the_same_store_it_serves(tmp_path):
         server.stop()
 
 
-def test_connect_on_a_fresh_store_survives_concurrent_readers(tmp_path):
-    """The reviewer's repro: `db.connect` on a not-yet-created store while
-    reader threads loop `_open_readonly` + a query (about half the writes
-    failed with `disk I/O error` before the fix)."""
-    failures = []
-    for i in range(60):
-        store = tmp_path / f"s{i}"
-        app = server.MeterApp(store, discovery_cache_ttl=0)
-        stop = threading.Event()
-
-        def reader():
-            while not stop.is_set():
-                try:
-                    conn = server._open_readonly(app.db_file, "calls")
-                    if conn is not None:
-                        conn.execute("SELECT COUNT(*) FROM calls").fetchone()
-                        conn.close()
-                    app.projects()
-                except Exception as exc:  # noqa: BLE001
-                    failures.append(f"reader {i}: {exc!r}")
-
-        readers = [threading.Thread(target=reader, daemon=True) for _ in range(3)]
-        for t in readers:
-            t.start()
-        try:
-            db.connect(store).close()
-        except Exception as exc:  # noqa: BLE001
-            failures.append(f"writer {i}: {exc!r}")
-        finally:
-            stop.set()
-            for t in readers:
-                t.join()
-    assert failures == []
-
-
 def test_first_run_readers_never_break_the_store_or_the_backfill(tmp_path, capfd):
     """Readers hammer `_open_readonly` + a query on a store that does not
     exist yet while `start()` creates it and backfills. Before the fix the
@@ -983,6 +948,41 @@ def test_first_run_readers_never_break_the_store_or_the_backfill(tmp_path, capfd
     assert "backfill failed" not in err
 
 
+def test_connect_on_a_fresh_store_survives_concurrent_readers(tmp_path):
+    """The reviewer's repro: `db.connect` on a not-yet-created store while
+    reader threads loop `_open_readonly` + a query (about half the writes
+    failed with `disk I/O error` before the fix)."""
+    failures = []
+    for i in range(60):
+        store = tmp_path / f"s{i}"
+        app = server.MeterApp(store, discovery_cache_ttl=0)
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    conn = server._open_readonly(app.db_file, "calls")
+                    if conn is not None:
+                        conn.execute("SELECT COUNT(*) FROM calls").fetchone()
+                        conn.close()
+                    app.projects()
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(f"reader {i}: {exc!r}")
+
+        readers = [threading.Thread(target=reader, daemon=True) for _ in range(3)]
+        for t in readers:
+            t.start()
+        try:
+            db.connect(store).close()
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"writer {i}: {exc!r}")
+        finally:
+            stop.set()
+            for t in readers:
+                t.join()
+    assert failures == []
+
+
 def test_projects_tolerates_a_store_missing_the_sessions_table(tmp_path):
     store = tmp_path / "store"
     store.mkdir()
@@ -1010,3 +1010,13 @@ def test_open_readonly_reports_no_data_until_every_table_exists(tmp_path):
     ro = server._open_readonly(db.db_path(full), "calls")
     assert ro is not None
     ro.close()
+
+
+def test_backfill_failure_is_logged_to_stderr(capsys):
+    def boom(**_kwargs):
+        raise RuntimeError("kaboom")
+
+    server._run_backfill(boom, Path("/nowhere"), Path("/nowhere"))
+    err = capsys.readouterr().err
+    assert "backfill failed" in err
+    assert "kaboom" in err

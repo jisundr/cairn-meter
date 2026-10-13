@@ -1102,11 +1102,21 @@ def start(
         import backfill  # noqa: E402
 
         threading.Thread(
-            target=backfill.run,
-            kwargs={"store_dir": app.store_dir, "claude_projects_dir": app.claude_projects_dir},
+            target=_run_backfill,
+            args=(backfill.run, app.store_dir, app.claude_projects_dir),
             daemon=True,
         ).start()
     return httpd.server_address[1]
+
+
+def _run_backfill(run_fn, store_dir: Path, claude_projects_dir: Path) -> None:
+    """Backfill thread target: a failure is logged to stderr, never silent."""
+    try:
+        run_fn(store_dir=store_dir, claude_projects_dir=claude_projects_dir)
+    except Exception:
+        import traceback
+
+        print("cairn-meter: backfill failed:\n" + traceback.format_exc(), file=sys.stderr, flush=True)
 
 
 def stop() -> None:
