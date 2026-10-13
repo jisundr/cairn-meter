@@ -1,0 +1,19 @@
+{
+  "name": "cairn-meter",
+  "displayName": "Cairn Meter",
+  "version": "0.1.0",
+  "description": "Token and cost metering for Claude Code sessions, with a local dashboard. Works on its own; writes a usage.json export when a project has .cairn/.",
+  "author": {
+    "name": "Jayson De los Reyes",
+    "email": "jisun.delosreyes@gmail.com"
+  },
+  "repository": "https://github.com/jisundr/cairn-meter",
+  "homepage": "https://github.com/jisundr/cairn-meter#readme",
+  "license": "MIT",
+  "keywords": [
+    "tokens",
+    "cost",
+    "metering",
+    "dashboard"
+  ]
+}
