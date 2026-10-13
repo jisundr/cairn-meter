@@ -920,6 +920,7 @@ def test_first_run_readers_never_break_the_store_or_the_backfill(tmp_path, capfd
                     app.projects()
                 except Exception as exc:  # noqa: BLE001
                     failures.append(f"reader: {exc!r}")
+                time.sleep(0.001)
 
         readers = [threading.Thread(target=reader, daemon=True) for _ in range(3)]
         try:
@@ -943,7 +944,10 @@ def test_first_run_readers_never_break_the_store_or_the_backfill(tmp_path, capfd
         finally:
             stop.set()
             for t in readers:
-                t.join()
+                t.join(timeout=10)
+            stuck = [t for t in readers if t.is_alive()]
+            if stuck:
+                failures.append(f"iteration {i}: {len(stuck)} reader thread(s) still alive")
             server.stop()
     err = capfd.readouterr().err
     assert failures == []
@@ -970,6 +974,7 @@ def test_connect_on_a_fresh_store_survives_concurrent_readers(tmp_path):
                     app.projects()
                 except Exception as exc:  # noqa: BLE001
                     failures.append(f"reader {i}: {exc!r}")
+                time.sleep(0.001)
 
         readers = [threading.Thread(target=reader, daemon=True) for _ in range(3)]
         for t in readers:
@@ -981,7 +986,10 @@ def test_connect_on_a_fresh_store_survives_concurrent_readers(tmp_path):
         finally:
             stop.set()
             for t in readers:
-                t.join()
+                t.join(timeout=10)
+            stuck = [t for t in readers if t.is_alive()]
+            if stuck:
+                failures.append(f"writer {i}: {len(stuck)} reader thread(s) still alive")
     assert failures == []
 
 
