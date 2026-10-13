@@ -4,6 +4,7 @@ import socket
 import sqlite3
 import sys
 import threading
+import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -887,3 +888,38 @@ def test_start_runs_backfill_into_the_same_store_it_serves(tmp_path):
         assert [r["session_id"] for r in rows] == ["sess-bf"]
     finally:
         server.stop()
+
+
+def test_connect_on_a_fresh_store_survives_concurrent_readers(tmp_path):
+    """The reviewer's repro: `db.connect` on a not-yet-created store while
+    reader threads loop `_open_readonly` + a query (about half the writes
+    failed with `disk I/O error` before the fix)."""
+    failures = []
+    for i in range(60):
+        store = tmp_path / f"s{i}"
+        app = server.MeterApp(store, discovery_cache_ttl=0)
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    conn = server._open_readonly(app.db_file, "calls")
+                    if conn is not None:
+                        conn.execute("SELECT COUNT(*) FROM calls").fetchone()
+                        conn.close()
+                    app.projects()
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(f"reader {i}: {exc!r}")
+
+        readers = [threading.Thread(target=reader, daemon=True) for _ in range(3)]
+        for t in readers:
+            t.start()
+        try:
+            db.connect(store).close()
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"writer {i}: {exc!r}")
+        finally:
+            stop.set()
+            for t in readers:
+                t.join()
+    assert failures == []

@@ -9,7 +9,9 @@ Usage:
     from db import connect, insert_call, save_session
     conn = connect(store_dir)   # opens/creates store_dir/meter.db with tables
 """
+import os
 import sqlite3
+import threading
 from pathlib import Path
 
 DB_FILENAME = "meter.db"
@@ -87,10 +89,7 @@ def db_path(store_dir: Path) -> Path:
     return Path(store_dir) / DB_FILENAME
 
 
-def connect(store_dir: Path) -> sqlite3.Connection:
-    store_dir = Path(store_dir)
-    store_dir.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path(store_dir))
+def _initialise(conn: sqlite3.Connection) -> None:
     # WAL mode lets a writer (the parser) and a reader (the server) touch
     # the same file at once without contending destructively - set this
     # before any table exists so every subsequent connection sees it.
@@ -108,6 +107,37 @@ def connect(store_dir: Path) -> sqlite3.Connection:
     if current_version < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
+
+
+def _create_store(path: Path) -> None:
+    """Build a fully initialised WAL database beside `path`, then publish it
+    under `path` atomically (hard link: never clobbers a store another
+    process just created). A concurrent reader therefore sees either no file
+    or a complete one, never a database mid WAL-conversion or half-schema'd.
+    """
+    staging = path.with_name(f"{path.name}.init-{os.getpid()}-{threading.get_ident()}")
+    conn = sqlite3.connect(staging)
+    try:
+        _initialise(conn)
+    finally:
+        conn.close()
+    try:
+        os.link(staging, path)
+    except FileExistsError:
+        pass
+    finally:
+        for leftover in (staging, Path(f"{staging}-wal"), Path(f"{staging}-shm")):
+            leftover.unlink(missing_ok=True)
+
+
+def connect(store_dir: Path) -> sqlite3.Connection:
+    store_dir = Path(store_dir)
+    store_dir.mkdir(parents=True, exist_ok=True)
+    path = db_path(store_dir)
+    if not path.exists():
+        _create_store(path)
+    conn = sqlite3.connect(path)
+    _initialise(conn)  # idempotent: upgrades an older store's schema
     return conn
 
 
