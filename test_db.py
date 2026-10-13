@@ -2,6 +2,7 @@ import errno
 import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -381,3 +382,19 @@ def test_link_failure_does_not_clobber_a_store_that_already_exists(tmp_path, mon
         assert conn.execute("SELECT COUNT(*) FROM calls").fetchone()[0] == 1
     finally:
         conn.close()
+
+
+def test_connect_removes_stale_staging_files_but_keeps_fresh_ones(tmp_path):
+    store = tmp_path / "store"
+    store.mkdir()
+    old = store / "meter.db.init-111-222"
+    fresh = store / "meter.db.init-333-444"
+    old.write_bytes(b"x")
+    fresh.write_bytes(b"x")
+    long_ago = time.time() - 3600
+    os.utime(old, (long_ago, long_ago))
+
+    db.connect(store).close()
+
+    assert not old.exists()
+    assert fresh.exists()

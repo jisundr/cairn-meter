@@ -12,6 +12,7 @@ Usage:
 import os
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 DB_FILENAME = "meter.db"
@@ -114,6 +115,26 @@ def _initialise(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+STALE_STAGING_SECONDS = 60
+
+
+def _remove_stale_staging(path: Path, keep: Path) -> None:
+    """Unlink staging files a crashed or killed process left behind. Best
+    effort: never the file in use, and every error is ignored."""
+    cutoff = time.time() - STALE_STAGING_SECONDS
+    try:
+        for candidate in path.parent.glob(f"{path.name}.init-*"):
+            if candidate == keep:
+                continue
+            try:
+                if candidate.stat().st_mtime < cutoff:
+                    candidate.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def _create_store(path: Path) -> None:
     """Build a fully initialised WAL database beside `path`, then publish it
     under `path` atomically (hard link: never clobbers a store another
@@ -126,6 +147,7 @@ def _create_store(path: Path) -> None:
     clobber a store a concurrent winner already populated.
     """
     staging = path.with_name(f"{path.name}.init-{os.getpid()}-{threading.get_ident()}")
+    _remove_stale_staging(path, staging)
     link_failed = False
     try:
         conn = sqlite3.connect(staging)
