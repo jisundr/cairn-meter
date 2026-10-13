@@ -1075,6 +1075,10 @@ def start(
     """
     stop()
     app = MeterApp(store_dir, claude_projects_dir=claude_projects_dir)
+    # Create and fully initialise the store (WAL + whole schema) before any
+    # thread starts, so readers only ever see a complete WAL database and the
+    # backfill writer never races a reader mid-conversion.
+    db.connect(app.store_dir).close()
     handler_cls = make_handler(app)
     httpd = http.server.ThreadingHTTPServer((host, port), handler_cls)
     handler_cls.allowed_hosts = allowed_hosts(httpd)

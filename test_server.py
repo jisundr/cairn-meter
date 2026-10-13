@@ -880,11 +880,13 @@ def test_start_runs_backfill_into_the_same_store_it_serves(tmp_path):
     store = tmp_path / "store"
     port = server.start(store, claude_projects_dir=claude_projects)
     try:
-        deadline = datetime.now().timestamp() + 5
+        deadline = time.monotonic() + 15
         rows = []
-        while datetime.now().timestamp() < deadline and not rows:
+        while time.monotonic() < deadline and not rows:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/rollup/session?range=life") as resp:
                 rows = json.loads(resp.read())["data"]
+            if not rows:
+                time.sleep(0.02)
         assert [r["session_id"] for r in rows] == ["sess-bf"]
     finally:
         server.stop()
@@ -923,3 +925,59 @@ def test_connect_on_a_fresh_store_survives_concurrent_readers(tmp_path):
             for t in readers:
                 t.join()
     assert failures == []
+
+
+def test_first_run_readers_never_break_the_store_or_the_backfill(tmp_path, capfd):
+    """Readers hammer `_open_readonly` + a query on a store that does not
+    exist yet while `start()` creates it and backfills. Before the fix the
+    reader opened the file mid WAL-conversion: the backfill writer died with
+    `disk I/O error` and readers hit `no such table: sessions`."""
+    entry = {"requestId": "req-r", "cwd": "/w/proj", "timestamp": "2026-08-28T12:00:00Z",
+             "message": {"model": "claude-sonnet-5", "usage": {"input_tokens": 5, "output_tokens": 1}}}
+    failures = []
+    for i in range(25):
+        iteration = tmp_path / f"it{i}"
+        claude_projects = iteration / "claude-projects"
+        _write_transcript(claude_projects / "-w-proj" / "sess-r.jsonl", [entry])
+        store = iteration / "store"
+        app = server.MeterApp(store, claude_projects_dir=claude_projects, discovery_cache_ttl=0)
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    conn = server._open_readonly(app.db_file, "calls")
+                    if conn is not None:
+                        conn.execute("SELECT COUNT(*) FROM calls").fetchone()
+                        conn.close()
+                    app.projects()
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(f"reader: {exc!r}")
+
+        readers = [threading.Thread(target=reader, daemon=True) for _ in range(3)]
+        try:
+            for t in readers:
+                t.start()
+            server.start(store, claude_projects_dir=claude_projects)
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if db.db_path(store).exists():
+                    check = sqlite3.connect(db.db_path(store))
+                    try:
+                        if check.execute("SELECT COUNT(*) FROM calls").fetchone()[0]:
+                            break
+                    finally:
+                        check.close()
+                time.sleep(0.01)
+            else:
+                failures.append(f"iteration {i}: backfill never wrote history")
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"iteration {i}: start: {exc!r}")
+        finally:
+            stop.set()
+            for t in readers:
+                t.join()
+            server.stop()
+    err = capfd.readouterr().err
+    assert failures == []
+    assert "backfill failed" not in err
