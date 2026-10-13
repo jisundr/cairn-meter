@@ -37,7 +37,16 @@ jobs:
         run: |
           npm ci
           npm run build
-          npm test
+      - name: Built frontend matches the committed static/
+        run: |
+          if [ -n "$(git status --porcelain static)" ]; then
+            git status --short static
+            echo "static/ is out of sync with the build (changed or untracked files)" >&2
+            exit 1
+          fi
+      - name: Frontend unit tests
+        working-directory: frontend
+        run: npm test
       - name: Frontend e2e
         working-directory: frontend
         run: |
