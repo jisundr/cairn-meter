@@ -27,6 +27,8 @@ Requires Python 3.11 or later on `PATH` as `python3`. There are no Python packag
 
 The Stop hook (`hooks/stop-meter.sh`) does the recording; there is nothing to run by hand.
 
+The Stop hook exports `usage.json` only when the session's cwd is the project root that holds `.cairn/`; a session started in a subdirectory gets none (a v1 limitation). A session's project is pinned to the first cwd seen.
+
 ## What it writes
 
 | Where | What | When |
