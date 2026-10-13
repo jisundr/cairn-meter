@@ -1,9 +1,12 @@
+import errno
+import os
 import sqlite3
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db  # noqa: E402
+import pytest  # noqa: E402
 
 
 def make_row(**overrides):
@@ -335,3 +338,46 @@ def test_save_session_without_a_transcript_keeps_the_known_one(tmp_path):
     db.save_session(conn, session_id="sess-1", project="/work/app", transcript_path=None)
 
     assert conn.execute("SELECT transcript_path FROM sessions").fetchone() == ("/t/a.jsonl",)
+
+
+def _no_staging_left(store):
+    return [p.name for p in Path(store).iterdir() if ".init-" in p.name] == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError(errno.ENOTSUP, "not supported"), PermissionError(errno.EPERM, "denied"),
+     OSError(errno.EXDEV, "cross-device")],
+)
+def test_connect_falls_back_to_in_place_init_when_hard_links_fail(tmp_path, monkeypatch, error):
+    def refuse(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(os, "link", refuse)
+    store = tmp_path / "store"
+    conn = db.connect(store)
+    try:
+        db.insert_call(conn, make_row())
+        conn.commit()
+        assert conn.execute("SELECT COUNT(*) FROM calls").fetchone()[0] == 1
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        conn.close()
+    assert _no_staging_left(store)
+
+
+def test_link_failure_does_not_clobber_a_store_that_already_exists(tmp_path, monkeypatch):
+    store = tmp_path / "store"
+    db.connect(store).close()
+    existing = db.connect(store)
+    db.insert_call(existing, make_row())
+    existing.commit()
+    existing.close()
+
+    monkeypatch.setattr(os, "link", lambda *a, **k: (_ for _ in ()).throw(OSError(errno.EPERM, "x")))
+    db._create_store(db.db_path(store))  # simulates losing a race, link unsupported
+    conn = db.connect(store)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM calls").fetchone()[0] == 1
+    finally:
+        conn.close()

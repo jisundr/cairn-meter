@@ -1,5 +1,7 @@
+import errno
 import http.server
 import json
+import os
 import socket
 import sqlite3
 import sys
@@ -981,6 +983,26 @@ def test_connect_on_a_fresh_store_survives_concurrent_readers(tmp_path):
             for t in readers:
                 t.join()
     assert failures == []
+
+
+@pytest.mark.parametrize(
+    "error", [OSError(errno.ENOTSUP, "not supported"), PermissionError(errno.EPERM, "denied")]
+)
+def test_start_still_serves_when_the_filesystem_cannot_hard_link(tmp_path, monkeypatch, error):
+    def refuse(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(os, "link", refuse)
+    store = tmp_path / "store"
+    port = server.start(store, backfill_enabled=False)
+    try:
+        assert port > 0
+        assert db.db_path(store).exists()
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/rollup/session?range=life") as resp:
+            assert resp.status == 200
+    finally:
+        server.stop()
+    assert [p.name for p in store.iterdir() if ".init-" in p.name] == []
 
 
 def test_projects_tolerates_a_store_missing_the_sessions_table(tmp_path):

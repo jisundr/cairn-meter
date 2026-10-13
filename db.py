@@ -119,20 +119,35 @@ def _create_store(path: Path) -> None:
     under `path` atomically (hard link: never clobbers a store another
     process just created). A concurrent reader therefore sees either no file
     or a complete one, never a database mid WAL-conversion or half-schema'd.
+
+    If the filesystem cannot hard link (EPERM, ENOTSUP, EXDEV, ...), fall back
+    to initialising `path` in place, accepting the small first-run race the
+    staging scheme otherwise avoids. Never rename over `path`: that would
+    clobber a store a concurrent winner already populated.
     """
     staging = path.with_name(f"{path.name}.init-{os.getpid()}-{threading.get_ident()}")
-    conn = sqlite3.connect(staging)
+    link_failed = False
     try:
-        _initialise(conn)
-    finally:
-        conn.close()
-    try:
-        os.link(staging, path)
-    except FileExistsError:
-        pass
+        conn = sqlite3.connect(staging)
+        try:
+            _initialise(conn)
+        finally:
+            conn.close()
+        try:
+            os.link(staging, path)
+        except FileExistsError:
+            pass
+        except OSError:
+            link_failed = True
     finally:
         for leftover in (staging, Path(f"{staging}-wal"), Path(f"{staging}-shm")):
             leftover.unlink(missing_ok=True)
+    if link_failed:
+        conn = sqlite3.connect(path)
+        try:
+            _initialise(conn)
+        finally:
+            conn.close()
 
 
 def connect(store_dir: Path) -> sqlite3.Connection:
