@@ -591,13 +591,22 @@ def lookup_transcript_content(
 
 def _open_readonly(db_path: Path, table: str) -> sqlite3.Connection | None:
     """A read-only connection to `db_path`, or None if it's missing or
-    doesn't yet have `table` (cold start: no `Stop` event has fired yet).
+    doesn't yet have every table in `db.REQUIRED_TABLES` (cold start, or a
+    store still being initialised): callers treat None as "no data yet".
+    `table` is probed too, so a caller never queries a table that is absent.
     """
     if not db_path.exists():
         return None
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        return None
     conn.row_factory = sqlite3.Row
     try:
+        present = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if not set(db.REQUIRED_TABLES) <= present:
+            conn.close()
+            return None
         conn.execute(f"SELECT 1 FROM {table} LIMIT 1")
     except sqlite3.OperationalError:
         conn.close()
@@ -649,6 +658,8 @@ class MeterApp:
                     "LEFT JOIN sessions s ON s.session_id = c.session_id ORDER BY s.project"
                 ).fetchall()
                 roots = [row[0] for row in rows]
+            except sqlite3.OperationalError:
+                roots = []  # `sessions`/`calls` missing: no data yet
             finally:
                 conn.close()
         fresh = projects_from_roots(roots)
@@ -1075,6 +1086,10 @@ def start(
     """
     stop()
     app = MeterApp(store_dir, claude_projects_dir=claude_projects_dir)
+    # Create and fully initialise the store (WAL + whole schema) before any
+    # thread starts, so readers only ever see a complete WAL database and the
+    # backfill writer never races a reader mid-conversion.
+    db.connect(app.store_dir).close()
     handler_cls = make_handler(app)
     httpd = http.server.ThreadingHTTPServer((host, port), handler_cls)
     handler_cls.allowed_hosts = allowed_hosts(httpd)
@@ -1087,11 +1102,21 @@ def start(
         import backfill  # noqa: E402
 
         threading.Thread(
-            target=backfill.run,
-            kwargs={"store_dir": app.store_dir, "claude_projects_dir": app.claude_projects_dir},
+            target=_run_backfill,
+            args=(backfill.run, app.store_dir, app.claude_projects_dir),
             daemon=True,
         ).start()
     return httpd.server_address[1]
+
+
+def _run_backfill(run_fn, store_dir: Path, claude_projects_dir: Path) -> None:
+    """Backfill thread target: a failure is logged to stderr, never silent."""
+    try:
+        run_fn(store_dir=store_dir, claude_projects_dir=claude_projects_dir)
+    except Exception:
+        import traceback
+
+        print("cairn-meter: backfill failed:\n" + traceback.format_exc(), file=sys.stderr, flush=True)
 
 
 def stop() -> None:

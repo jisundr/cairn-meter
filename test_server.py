@@ -1,9 +1,12 @@
+import errno
 import http.server
 import json
+import os
 import socket
 import sqlite3
 import sys
 import threading
+import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -879,11 +882,171 @@ def test_start_runs_backfill_into_the_same_store_it_serves(tmp_path):
     store = tmp_path / "store"
     port = server.start(store, claude_projects_dir=claude_projects)
     try:
-        deadline = datetime.now().timestamp() + 5
+        deadline = time.monotonic() + 15
         rows = []
-        while datetime.now().timestamp() < deadline and not rows:
+        while time.monotonic() < deadline and not rows:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/rollup/session?range=life") as resp:
                 rows = json.loads(resp.read())["data"]
+            if not rows:
+                time.sleep(0.02)
         assert [r["session_id"] for r in rows] == ["sess-bf"]
     finally:
         server.stop()
+
+
+def test_first_run_readers_never_break_the_store_or_the_backfill(tmp_path, capfd):
+    """Readers hammer `_open_readonly` + a query on a store that does not
+    exist yet while `start()` creates it and backfills. Before the fix the
+    reader opened the file mid WAL-conversion: the backfill writer died with
+    `disk I/O error` and readers hit `no such table: sessions`."""
+    entry = {"requestId": "req-r", "cwd": "/w/proj", "timestamp": "2026-08-28T12:00:00Z",
+             "message": {"model": "claude-sonnet-5", "usage": {"input_tokens": 5, "output_tokens": 1}}}
+    failures = []
+    for i in range(25):
+        iteration = tmp_path / f"it{i}"
+        claude_projects = iteration / "claude-projects"
+        _write_transcript(claude_projects / "-w-proj" / "sess-r.jsonl", [entry])
+        store = iteration / "store"
+        app = server.MeterApp(store, claude_projects_dir=claude_projects, discovery_cache_ttl=0)
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    conn = server._open_readonly(app.db_file, "calls")
+                    if conn is not None:
+                        conn.execute("SELECT COUNT(*) FROM calls").fetchone()
+                        conn.close()
+                    app.projects()
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(f"reader: {exc!r}")
+                time.sleep(0.001)
+
+        readers = [threading.Thread(target=reader, daemon=True) for _ in range(3)]
+        try:
+            for t in readers:
+                t.start()
+            server.start(store, claude_projects_dir=claude_projects)
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if db.db_path(store).exists():
+                    check = sqlite3.connect(db.db_path(store))
+                    try:
+                        if check.execute("SELECT COUNT(*) FROM calls").fetchone()[0]:
+                            break
+                    finally:
+                        check.close()
+                time.sleep(0.01)
+            else:
+                failures.append(f"iteration {i}: backfill never wrote history")
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"iteration {i}: start: {exc!r}")
+        finally:
+            stop.set()
+            for t in readers:
+                t.join(timeout=10)
+            stuck = [t for t in readers if t.is_alive()]
+            if stuck:
+                failures.append(f"iteration {i}: {len(stuck)} reader thread(s) still alive")
+            server.stop()
+    err = capfd.readouterr().err
+    assert failures == []
+    assert "backfill failed" not in err
+
+
+def test_connect_on_a_fresh_store_survives_concurrent_readers(tmp_path):
+    """The reviewer's repro: `db.connect` on a not-yet-created store while
+    reader threads loop `_open_readonly` + a query (about half the writes
+    failed with `disk I/O error` before the fix)."""
+    failures = []
+    for i in range(60):
+        store = tmp_path / f"s{i}"
+        app = server.MeterApp(store, discovery_cache_ttl=0)
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    conn = server._open_readonly(app.db_file, "calls")
+                    if conn is not None:
+                        conn.execute("SELECT COUNT(*) FROM calls").fetchone()
+                        conn.close()
+                    app.projects()
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(f"reader {i}: {exc!r}")
+                time.sleep(0.001)
+
+        readers = [threading.Thread(target=reader, daemon=True) for _ in range(3)]
+        for t in readers:
+            t.start()
+        try:
+            db.connect(store).close()
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"writer {i}: {exc!r}")
+        finally:
+            stop.set()
+            for t in readers:
+                t.join(timeout=10)
+            stuck = [t for t in readers if t.is_alive()]
+            if stuck:
+                failures.append(f"writer {i}: {len(stuck)} reader thread(s) still alive")
+    assert failures == []
+
+
+@pytest.mark.parametrize(
+    "error", [OSError(errno.ENOTSUP, "not supported"), PermissionError(errno.EPERM, "denied")]
+)
+def test_start_still_serves_when_the_filesystem_cannot_hard_link(tmp_path, monkeypatch, error):
+    def refuse(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(os, "link", refuse)
+    store = tmp_path / "store"
+    port = server.start(store, backfill_enabled=False)
+    try:
+        assert port > 0
+        assert db.db_path(store).exists()
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/rollup/session?range=life") as resp:
+            assert resp.status == 200
+    finally:
+        server.stop()
+    assert [p.name for p in store.iterdir() if ".init-" in p.name] == []
+
+
+def test_projects_tolerates_a_store_missing_the_sessions_table(tmp_path):
+    store = tmp_path / "store"
+    store.mkdir()
+    conn = sqlite3.connect(db.db_path(store))
+    conn.execute(db.CALLS_SCHEMA)
+    conn.execute(
+        "INSERT INTO calls (request_id, session_id, model, timestamp, input_tokens, output_tokens) "
+        "VALUES ('r', 's', 'claude-sonnet-5', '2026-08-28T12:00:00Z', 1, 1)"
+    )
+    conn.commit()
+    conn.close()
+    app = server.MeterApp(store, discovery_cache_ttl=0)
+    assert app.projects() == []
+
+
+def test_open_readonly_reports_no_data_until_every_table_exists(tmp_path):
+    path = tmp_path / "meter.db"
+    conn = sqlite3.connect(path)
+    conn.execute(db.CALLS_SCHEMA)
+    conn.commit()
+    conn.close()
+    assert server._open_readonly(path, "calls") is None
+    full = tmp_path / "full"
+    db.connect(full).close()
+    ro = server._open_readonly(db.db_path(full), "calls")
+    assert ro is not None
+    ro.close()
+
+
+def test_backfill_failure_is_logged_to_stderr(capsys):
+    def boom(**_kwargs):
+        raise RuntimeError("kaboom")
+
+    server._run_backfill(boom, Path("/nowhere"), Path("/nowhere"))
+    err = capsys.readouterr().err
+    assert "backfill failed" in err
+    assert "kaboom" in err

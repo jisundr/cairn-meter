@@ -9,7 +9,10 @@ Usage:
     from db import connect, insert_call, save_session
     conn = connect(store_dir)   # opens/creates store_dir/meter.db with tables
 """
+import os
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 DB_FILENAME = "meter.db"
@@ -83,14 +86,16 @@ USAGE_LIMIT_EVENTS_SESSION_INDEX = (
 )
 
 
+# Every table `connect` creates; readers treat the store as "no data yet"
+# until all of them exist.
+REQUIRED_TABLES = ("calls", "usage_limit_events", "tool_uses", "session_labels", "sessions")
+
+
 def db_path(store_dir: Path) -> Path:
     return Path(store_dir) / DB_FILENAME
 
 
-def connect(store_dir: Path) -> sqlite3.Connection:
-    store_dir = Path(store_dir)
-    store_dir.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path(store_dir))
+def _initialise(conn: sqlite3.Connection) -> None:
     # WAL mode lets a writer (the parser) and a reader (the server) touch
     # the same file at once without contending destructively - set this
     # before any table exists so every subsequent connection sees it.
@@ -108,6 +113,73 @@ def connect(store_dir: Path) -> sqlite3.Connection:
     if current_version < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
+
+
+STALE_STAGING_SECONDS = 60
+
+
+def _remove_stale_staging(path: Path, keep: Path) -> None:
+    """Unlink staging files a crashed or killed process left behind. Best
+    effort: never the file in use, and every error is ignored."""
+    cutoff = time.time() - STALE_STAGING_SECONDS
+    try:
+        for candidate in path.parent.glob(f"{path.name}.init-*"):
+            if candidate == keep:
+                continue
+            try:
+                if candidate.stat().st_mtime < cutoff:
+                    candidate.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _create_store(path: Path) -> None:
+    """Build a fully initialised WAL database beside `path`, then publish it
+    under `path` atomically (hard link: never clobbers a store another
+    process just created). A concurrent reader therefore sees either no file
+    or a complete one, never a database mid WAL-conversion or half-schema'd.
+
+    If the filesystem cannot hard link (EPERM, ENOTSUP, EXDEV, ...), fall back
+    to initialising `path` in place, accepting the small first-run race the
+    staging scheme otherwise avoids. Never rename over `path`: that would
+    clobber a store a concurrent winner already populated.
+    """
+    staging = path.with_name(f"{path.name}.init-{os.getpid()}-{threading.get_ident()}")
+    _remove_stale_staging(path, staging)
+    link_failed = False
+    try:
+        conn = sqlite3.connect(staging)
+        try:
+            _initialise(conn)
+        finally:
+            conn.close()
+        try:
+            os.link(staging, path)
+        except FileExistsError:
+            pass
+        except OSError:
+            link_failed = True
+    finally:
+        for leftover in (staging, Path(f"{staging}-wal"), Path(f"{staging}-shm")):
+            leftover.unlink(missing_ok=True)
+    if link_failed:
+        conn = sqlite3.connect(path)
+        try:
+            _initialise(conn)
+        finally:
+            conn.close()
+
+
+def connect(store_dir: Path) -> sqlite3.Connection:
+    store_dir = Path(store_dir)
+    store_dir.mkdir(parents=True, exist_ok=True)
+    path = db_path(store_dir)
+    if not path.exists():
+        _create_store(path)
+    conn = sqlite3.connect(path)
+    _initialise(conn)  # idempotent: upgrades an older store's schema
     return conn
 
 
