@@ -971,8 +971,20 @@ _PLACEHOLDER_HTML = (
 
 class Handler(http.server.BaseHTTPRequestHandler):
     app: "MeterApp" = None
+    # Host header values this server answers to; set once the port is bound.
+    # Empty means nothing is allowed. Anything else is a DNS-rebinding attempt.
+    allowed_hosts: frozenset = frozenset()
+
+    def _host_ok(self) -> bool:
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host in self.allowed_hosts:
+            return True
+        self._write_json(403, {"error": "forbidden host"})
+        return False
 
     def do_GET(self):
+        if not self._host_ok():
+            return
         parsed = urlparse(self.path)
         if parsed.path.startswith("/api/"):
             status, body = self.app.handle_api(parsed.path, parse_qs(parsed.query))
@@ -1026,6 +1038,16 @@ def make_handler(app: MeterApp) -> type:
     return type("BoundHandler", (Handler,), {"app": app})
 
 
+def allowed_hosts(httpd) -> frozenset:
+    """`127.0.0.1:<port>` and `localhost:<port>` for the port actually bound,
+    plus `[::1]:<port>` only when the socket really is IPv6."""
+    bound = httpd.server_address[1]
+    names = ["127.0.0.1", "localhost"]
+    if httpd.address_family == socket.AF_INET6:
+        names.append("[::1]")
+    return frozenset(f"{n}:{bound}" for n in names)
+
+
 # --------------------------------------------------------------------------
 # start()/stop() (free functions); `run`/`main` are thin foreground wrappers.
 # --------------------------------------------------------------------------
@@ -1055,6 +1077,7 @@ def start(
     app = MeterApp(store_dir, claude_projects_dir=claude_projects_dir)
     handler_cls = make_handler(app)
     httpd = http.server.ThreadingHTTPServer((host, port), handler_cls)
+    handler_cls.allowed_hosts = allowed_hosts(httpd)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     with _server_lock:

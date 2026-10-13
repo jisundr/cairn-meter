@@ -350,8 +350,9 @@ def test_safe_static_path_refuses_a_nul_byte(static_site, rel):
     assert server._safe_static_path(static_site, rel) is None
 
 
-def _raw_get(port: int, raw_path: bytes) -> bytes:
-    request = b"GET " + raw_path + b" HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+def _raw_get(port: int, raw_path: bytes, host: bytes | None = b"127.0.0.1") -> bytes:
+    host_line = b"Host: " + host + b"\r\n" if host is not None else b""
+    request = b"GET " + raw_path + b" HTTP/1.1\r\n" + host_line + b"Connection: close\r\n\r\n"
     with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
         sock.sendall(request)
         chunks = []
@@ -363,11 +364,13 @@ def _raw_get(port: int, raw_path: bytes) -> bytes:
 @pytest.mark.parametrize("raw_path", [b"/\x00", b"/assets/\x00x.js"])
 def test_http_static_route_answers_a_raw_nul_byte_with_the_spa_fallback(tmp_path, static_site, raw_path):
     app = server.MeterApp(make_store(tmp_path), static_dir=static_site)
-    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.make_handler(app))
+    handler = server.make_handler(app)
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    handler.allowed_hosts = server.allowed_hosts(httpd)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     port = httpd.server_address[1]
     try:
-        response = _raw_get(port, raw_path)
+        response = _raw_get(port, raw_path, host=f"127.0.0.1:{port}".encode())
         assert response.startswith(b"HTTP/1.")
         head, _, body = response.partition(b"\r\n\r\n")
         assert b" 200 " in head.split(b"\r\n")[0]
@@ -378,6 +381,57 @@ def test_http_static_route_answers_a_raw_nul_byte_with_the_spa_fallback(tmp_path
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+@pytest.fixture(scope="module")
+def live_port(tmp_path_factory):
+    """One server for the Host-header tests (httpd.shutdown() costs ~0.5s)."""
+    tmp_path = tmp_path_factory.mktemp("host")
+    static = tmp_path / "static"
+    (static / "assets").mkdir(parents=True)
+    (static / "index.html").write_text("<!doctype html><p>spa</p>\n")
+    (static / "assets" / "app.js").write_text("console.log(1)\n")
+    app = server.MeterApp(make_store(tmp_path, calls=[make_call()]), static_dir=static)
+    handler = server.make_handler(app)
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    handler.allowed_hosts = server.allowed_hosts(httpd)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    yield httpd.server_address[1]
+    httpd.shutdown()
+    httpd.server_close()
+
+
+@pytest.mark.parametrize("path", [b"/api/rollup/timeseries?range=life", b"/api/call/sess-1/1", b"/", b"/assets/app.js"])
+@pytest.mark.parametrize("host", [b"evil.example", b"evil.example:%d", b"127.0.0.1", b"localhost:1"])
+def test_forged_host_gets_403_json_on_api_and_static_routes(live_port, path, host):
+    if b"%d" in host:
+        host = host % live_port
+    response = _raw_get(live_port, path, host=host)
+    head, _, body = response.partition(b"\r\n\r\n")
+    assert b" 403 " in head.split(b"\r\n")[0]
+    assert json.loads(body) == {"error": "forbidden host"}
+
+
+def test_missing_host_header_is_refused(live_port):
+    response = _raw_get(live_port, b"/api/rollup/timeseries?range=life", host=None)
+    assert b" 403 " in response.split(b"\r\n")[0]
+
+
+@pytest.mark.parametrize("name", ["127.0.0.1", "localhost"])
+@pytest.mark.parametrize("path", [b"/api/rollup/timeseries?range=life", b"/api/call/sess-1/1", b"/assets/app.js"])
+def test_real_host_gets_200(live_port, name, path):
+    response = _raw_get(live_port, path, host=f"{name}:{live_port}".encode())
+    assert b" 200 " in response.split(b"\r\n")[0]
+
+
+def test_allowed_hosts_adds_ipv6_loopback_only_for_an_ipv6_socket():
+    class Fake:
+        server_address = ("::1", 4321)
+        address_family = socket.AF_INET6
+
+    assert "[::1]:4321" in server.allowed_hosts(Fake())
+    Fake.address_family = socket.AF_INET
+    assert server.allowed_hosts(Fake()) == {"127.0.0.1:4321", "localhost:4321"}
 
 
 # --------------------------------------------------------------------------
