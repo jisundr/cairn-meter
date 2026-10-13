@@ -1,4 +1,4 @@
-/* Header spacing token: header.app's padding above its rule, and the board's
+/* Header spacing token: header.app's padding above its rule, and the page's
    bottom gap to the window edge, so the two cannot drift. */
 :root { --header-pad: 16px; }
 :root {

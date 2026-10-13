@@ -8,7 +8,7 @@ import { ACCENT_THEMES, applyAccentTheme, getStoredAccentTheme, setStoredAccentT
 // bespoke implementation. Deliberately takes no props: it reads/writes
 // localStorage and the DOM attribute directly, which is what keeps the
 // accent independent of AppHeader's own props (activeTab, connected, etc.)
-// and of whatever project the board/Overview filter currently has selected.
+// and of whatever project the Overview filter currently has selected.
 export function AccentPicker() {
   const [open, setOpen] = useState(false);
   const [selected, setSelected] = useState<string | null>(() => getStoredAccentTheme());
