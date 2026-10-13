@@ -591,13 +591,22 @@ def lookup_transcript_content(
 
 def _open_readonly(db_path: Path, table: str) -> sqlite3.Connection | None:
     """A read-only connection to `db_path`, or None if it's missing or
-    doesn't yet have `table` (cold start: no `Stop` event has fired yet).
+    doesn't yet have every table in `db.REQUIRED_TABLES` (cold start, or a
+    store still being initialised): callers treat None as "no data yet".
+    `table` is probed too, so a caller never queries a table that is absent.
     """
     if not db_path.exists():
         return None
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        return None
     conn.row_factory = sqlite3.Row
     try:
+        present = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if not set(db.REQUIRED_TABLES) <= present:
+            conn.close()
+            return None
         conn.execute(f"SELECT 1 FROM {table} LIMIT 1")
     except sqlite3.OperationalError:
         conn.close()
@@ -649,6 +658,8 @@ class MeterApp:
                     "LEFT JOIN sessions s ON s.session_id = c.session_id ORDER BY s.project"
                 ).fetchall()
                 roots = [row[0] for row in rows]
+            except sqlite3.OperationalError:
+                roots = []  # `sessions`/`calls` missing: no data yet
             finally:
                 conn.close()
         fresh = projects_from_roots(roots)

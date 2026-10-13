@@ -85,6 +85,11 @@ USAGE_LIMIT_EVENTS_SESSION_INDEX = (
 )
 
 
+# Every table `connect` creates; readers treat the store as "no data yet"
+# until all of them exist.
+REQUIRED_TABLES = ("calls", "usage_limit_events", "tool_uses", "session_labels", "sessions")
+
+
 def db_path(store_dir: Path) -> Path:
     return Path(store_dir) / DB_FILENAME
 

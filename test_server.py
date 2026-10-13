@@ -981,3 +981,32 @@ def test_first_run_readers_never_break_the_store_or_the_backfill(tmp_path, capfd
     err = capfd.readouterr().err
     assert failures == []
     assert "backfill failed" not in err
+
+
+def test_projects_tolerates_a_store_missing_the_sessions_table(tmp_path):
+    store = tmp_path / "store"
+    store.mkdir()
+    conn = sqlite3.connect(db.db_path(store))
+    conn.execute(db.CALLS_SCHEMA)
+    conn.execute(
+        "INSERT INTO calls (request_id, session_id, model, timestamp, input_tokens, output_tokens) "
+        "VALUES ('r', 's', 'claude-sonnet-5', '2026-08-28T12:00:00Z', 1, 1)"
+    )
+    conn.commit()
+    conn.close()
+    app = server.MeterApp(store, discovery_cache_ttl=0)
+    assert app.projects() == []
+
+
+def test_open_readonly_reports_no_data_until_every_table_exists(tmp_path):
+    path = tmp_path / "meter.db"
+    conn = sqlite3.connect(path)
+    conn.execute(db.CALLS_SCHEMA)
+    conn.commit()
+    conn.close()
+    assert server._open_readonly(path, "calls") is None
+    full = tmp_path / "full"
+    db.connect(full).close()
+    ro = server._open_readonly(db.db_path(full), "calls")
+    assert ro is not None
+    ro.close()
