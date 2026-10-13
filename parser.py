@@ -117,7 +117,15 @@ def parse_transcript(entries: list[dict], *, session_id: str, agent: str, conn) 
         usage = message.get("usage")
 
         if usage is not None and request_id:
-            cache_creation = usage.get("cache_creation") or {}
+            cache_creation = usage.get("cache_creation")
+            if isinstance(cache_creation, dict) and cache_creation:
+                cache_write_5m = cache_creation.get("ephemeral_5m_input_tokens", 0)
+                cache_write_1h = cache_creation.get("ephemeral_1h_input_tokens", 0)
+            else:
+                # No TTL breakdown: price the flat total as 5m writes rather
+                # than silently dropping the cache-write cost.
+                cache_write_5m = usage.get("cache_creation_input_tokens") or 0
+                cache_write_1h = 0
             db.insert_call(
                 conn,
                 {
@@ -129,8 +137,8 @@ def parse_transcript(entries: list[dict], *, session_id: str, agent: str, conn) 
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
                     "cache_read_tokens": usage.get("cache_read_input_tokens", 0),
-                    "cache_write_5m_tokens": cache_creation.get("ephemeral_5m_input_tokens", 0),
-                    "cache_write_1h_tokens": cache_creation.get("ephemeral_1h_input_tokens", 0),
+                    "cache_write_5m_tokens": cache_write_5m,
+                    "cache_write_1h_tokens": cache_write_1h,
                 },
             )
 

@@ -409,3 +409,42 @@ def test_parse_session_with_no_project_anywhere_stores_null(tmp_path):
     conn = db.connect(store_dir)
     assert conn.execute("SELECT project FROM sessions").fetchone() == (None,)
     assert conn.execute("SELECT COUNT(*) FROM calls").fetchone() == (1,)
+
+
+def test_parse_session_falls_back_to_flat_cache_creation_total_as_5m_writes(tmp_path):
+    import pricing
+
+    store_dir = tmp_path / "store"
+    transcript_path = tmp_path / "session.jsonl"
+    entry = make_call_entry("req-flat")
+    entry["message"]["usage"] = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 1_000_000,
+    }
+    write_jsonl(transcript_path, [entry])
+
+    parser.parse_session(store_dir, transcript_path, "sess-1")
+
+    conn = db.connect(store_dir)
+    conn.row_factory = sqlite3.Row
+    row = dict(conn.execute("SELECT * FROM calls WHERE request_id = 'req-flat'").fetchone())
+    assert row["cache_write_5m_tokens"] == 1_000_000
+    assert row["cache_write_1h_tokens"] == 0
+    prices = {"m": {"input": 1, "output": 1, "cache_read": 1, "cache_write_5m": 3.75, "cache_write_1h": 6.0}}
+    assert pricing.call_cost({**row, "model": "m"}, prices=prices) == 3.75
+
+
+def test_parse_session_prefers_the_ttl_breakdown_over_the_flat_total(tmp_path):
+    store_dir = tmp_path / "store"
+    transcript_path = tmp_path / "session.jsonl"
+    write_jsonl(transcript_path, [make_call_entry("req-both", cache_creation_input_tokens=99)])
+
+    parser.parse_session(store_dir, transcript_path, "sess-1")
+
+    conn = db.connect(store_dir)
+    five, one = conn.execute(
+        "SELECT cache_write_5m_tokens, cache_write_1h_tokens FROM calls WHERE request_id = 'req-both'"
+    ).fetchone()
+    assert (five, one) == (1, 2)
